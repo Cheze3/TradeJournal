@@ -196,6 +196,55 @@ def screener_page(url: str) -> None:
     st.caption("This table describes past price moves. It does not predict future prices.")
 
 
+def delete_page(url: str) -> None:
+    st.header("Delete data")
+    st.warning("Deleting cannot be undone. You can restore data by uploading the original "
+               "CafeF files again.")
+    dates = cached_dates(url)
+    if not dates:
+        st.info("The database is already empty.")
+        return
+
+    key = st.session_state.setdefault("delete_key", 0)
+    mode = st.radio("What do you want to delete?", ["A range of dates", "Everything"])
+
+    if mode == "A range of dates":
+        left, right = st.columns(2)
+        start = left.date_input("From", value=dates[0], min_value=dates[0], max_value=dates[-1])
+        end = right.date_input("To", value=dates[0], min_value=dates[0], max_value=dates[-1])
+        if start > end:
+            st.error("The start date must be before the end date.")
+            return
+        count = db.count_rows(url, start, end)
+        if count == 0:
+            st.info("No stored rows fall in this range.")
+            return
+        st.write(f"This will delete **{count:,}** rows from {start:%d/%m/%Y} to {end:%d/%m/%Y}.")
+        phrase = "DELETE"
+    else:
+        count = db.count_rows(url)
+        st.write(f"This will delete **all {count:,}** rows and the upload history.")
+        phrase = "DELETE ALL"
+
+    typed = st.text_input(f"Type {phrase} to confirm", key=f"delete_confirm_{key}")
+    if st.button("Delete", type="primary", disabled=typed.strip() != phrase):
+        try:
+            with st.spinner("Deleting..."):
+                if mode == "A range of dates":
+                    removed = db.delete_range(url, start, end)
+                else:
+                    removed = db.delete_all(url)
+        except psycopg.Error as exc:
+            st.error("The delete failed and nothing was changed. Try again in a minute.")
+            with st.expander("Technical details"):
+                st.code(str(exc))
+            return
+        st.cache_data.clear()
+        st.session_state["delete_key"] += 1
+        st.session_state["last_delete"] = removed
+        st.rerun()
+
+
 def main() -> None:
     if not password_gate():
         return
@@ -205,13 +254,17 @@ def main() -> None:
     if "last_save" in st.session_state:
         r = st.session_state.pop("last_save")
         st.success(f"Saved. {r['new']:,} rows added, {r['updated']:,} rows refreshed.")
+    if "last_delete" in st.session_state:
+        st.success(f"Deleted {st.session_state.pop('last_delete'):,} rows.")
     show_status(url)
 
-    page = st.sidebar.radio("Page", ["Screener", "Update data"])
+    page = st.sidebar.radio("Page", ["Screener", "Update data", "Delete data"])
     if page == "Screener":
         screener_page(url)
-    else:
+    elif page == "Update data":
         upload_page(url)
+    else:
+        delete_page(url)
 
 
 main()

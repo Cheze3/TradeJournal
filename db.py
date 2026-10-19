@@ -101,3 +101,28 @@ def run_screen(url: str, start, end, threshold: int, min_value: float, min_price
         columns = [c.name for c in cur.description]
         rows = cur.fetchall()
     return pd.DataFrame(rows, columns=columns)
+
+
+def count_rows(url: str, start=None, end=None) -> int:
+    with connect(url) as conn:
+        if start is None:
+            return conn.execute("select count(*) from prices").fetchone()[0]
+        return conn.execute(
+            "select count(*) from prices where date between %s and %s", (start, end)
+        ).fetchone()[0]
+
+
+def delete_range(url: str, start, end) -> int:
+    """Delete price rows between two dates (inclusive). The upload history is kept."""
+    with connect(url) as conn:
+        return conn.execute(
+            "delete from prices where date between %s and %s", (start, end)
+        ).rowcount
+
+
+def delete_all(url: str) -> int:
+    """Remove every price row and the upload history. Returns the number of price rows removed."""
+    with connect(url) as conn:
+        n = conn.execute("select count(*) from prices").fetchone()[0]
+        conn.execute("truncate table prices, upload_log restart identity")
+    return n
