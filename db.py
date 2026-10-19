@@ -1,0 +1,87 @@
+"""Postgres access (Supabase). One short-lived connection per operation.
+
+A direct Postgres connection is used instead of the Supabase REST client because a save
+must be all-or-nothing, and batched REST calls cannot be wrapped in one transaction.
+"""
+from __future__ import annotations
+
+import pandas as pd
+import psycopg
+
+from parsing import DB_COLUMNS
+
+COLS_SQL = ", ".join(DB_COLUMNS)
+UPDATE_SQL = ", ".join(f"{c} = excluded.{c}" for c in DB_COLUMNS if c not in ("code", "date"))
+
+
+def connect(url: str) -> psycopg.Connection:
+    # prepare_threshold=None: Supabase's transaction pooler does not support prepared statements.
+    return psycopg.connect(url, connect_timeout=15, prepare_threshold=None)
+
+
+def _f(v):
+    return None if v is None or pd.isna(v) else float(v)
+
+
+def _i(v):
+    return None if v is None or pd.isna(v) else int(v)
+
+
+def _rows(df: pd.DataFrame):
+    for r in df.itertuples(index=False):
+        yield (r.code, r.date, _f(r.close), _f(r.adj_close), _f(r.change_pct),
+               _i(r.volume), _f(r.value), _f(r.open), _f(r.high), _f(r.low))
+
+
+def preview(url: str, df: pd.DataFrame) -> dict:
+    """How many rows of df are new, and how many already exist (and would be refreshed)."""
+    with connect(url) as conn:
+        existing = conn.execute(
+            "select code, date from prices where date between %s and %s",
+            (df["date"].min(), df["date"].max()),
+        ).fetchall()
+    keys = set(existing)
+    already = sum((c, d) in keys for c, d in zip(df["code"], df["date"]))
+    return {"rows": len(df), "new": len(df) - already, "existing": already}
+
+
+def save(url: str, df: pd.DataFrame, filenames: list[str]) -> dict:
+    """Upsert on (code, date) and write the upload log, in a single transaction."""
+    df = df.drop_duplicates(["code", "date"], keep="last")
+    with connect(url) as conn:  # commits on success, rolls back if anything raises
+        with conn.cursor() as cur:
+            cur.execute("create temp table staging (like prices including defaults) on commit drop")
+            with cur.copy(f"copy staging ({COLS_SQL}) from stdin") as copy:
+                for row in _rows(df):
+                    copy.write_row(row)
+            cur.execute(
+                f"""
+                insert into prices ({COLS_SQL})
+                select {COLS_SQL} from staging
+                on conflict (code, date) do update set {UPDATE_SQL}
+                returning (xmax = 0) as inserted  -- true for new rows, false for updated rows
+                """
+            )
+            flags = [inserted for (inserted,) in cur.fetchall()]
+            new = sum(flags)
+            updated = len(flags) - new
+            cur.execute(
+                """
+                insert into upload_log (filenames, rows_in_file, rows_new, rows_updated, date_min, date_max)
+                values (%s, %s, %s, %s, %s, %s)
+                """,
+                (", ".join(filenames), len(df), new, updated, df["date"].min(), df["date"].max()),
+            )
+    return {"rows": len(df), "new": new, "updated": updated}
+
+
+def status(url: str) -> dict:
+    with connect(url) as conn:
+        rows, stocks, dmin, dmax = conn.execute(
+            "select count(*), count(distinct code), min(date), max(date) from prices"
+        ).fetchone()
+        last = conn.execute(
+            "select uploaded_at, filenames from upload_log order by id desc limit 1"
+        ).fetchone()
+    return {"rows": rows, "stocks": stocks, "date_min": dmin, "date_max": dmax,
+            "last_upload": last[0] if last else None, "last_files": last[1] if last else None}
