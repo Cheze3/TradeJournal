@@ -9,6 +9,7 @@ import pandas as pd
 import psycopg
 
 from parsing import DB_COLUMNS
+from screening import LIMIT_TOLERANCE, PRICE_LIMIT_PCT, SCREEN_SQL
 
 COLS_SQL = ", ".join(DB_COLUMNS)
 UPDATE_SQL = ", ".join(f"{c} = excluded.{c}" for c in DB_COLUMNS if c not in ("code", "date"))
@@ -85,3 +86,18 @@ def status(url: str) -> dict:
         ).fetchone()
     return {"rows": rows, "stocks": stocks, "date_min": dmin, "date_max": dmax,
             "last_upload": last[0] if last else None, "last_files": last[1] if last else None}
+
+
+def trading_dates(url: str) -> list:
+    with connect(url) as conn:
+        return [d for (d,) in conn.execute("select distinct date from prices order by date").fetchall()]
+
+
+def run_screen(url: str, start, end, threshold: int, min_value: float, min_price: float) -> pd.DataFrame:
+    params = {"start": start, "end": end, "thr": threshold, "cap": PRICE_LIMIT_PCT + LIMIT_TOLERANCE,
+              "min_value": min_value, "min_price": min_price}
+    with connect(url) as conn:
+        cur = conn.execute(SCREEN_SQL, params)
+        columns = [c.name for c in cur.description]
+        rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=columns)

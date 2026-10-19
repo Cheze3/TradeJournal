@@ -1,4 +1,4 @@
-# HOSE Price Screener (upload page)
+# HOSE Price Screener
 
 ## Setup
 1. Create a Supabase project. In the SQL editor, run `schema.sql`.
@@ -17,6 +17,7 @@
 ```
 python tests/test_parsing.py                       # unit tests
 python tests/test_parsing.py path/to/cafef.xlsx    # also parse a real file
+python tests/test_screening.py path/to/cafef.xlsx  # screener counting logic (runs on SQLite)
 ```
 
 ## Behavior
@@ -24,3 +25,9 @@ python tests/test_parsing.py path/to/cafef.xlsx    # also parse a real file
 - Saving is one transaction: it either fully succeeds or changes nothing.
 - Rows are matched on (code, date). Existing rows are overwritten, new rows are added, nothing is deleted.
 - `change_pct` is the exchange-reported daily change in percent, parsed from the "Thay đổi" column.
+
+## Screener
+- A day is "up" when the exchange-reported daily change is at least +X%, "down" when it is at most -X% (X = 1 to 7).
+- Daily moves beyond 7.1% in either direction are ignored (e.g. first trading day of a new listing, where the limit is wider).
+- Filters default to a minimum average daily traded value of 5 billion VND. Without it, the list fills with stocks that barely trade.
+- Prices are in thousand VND and traded value in billion VND, as exported by CafeF.
