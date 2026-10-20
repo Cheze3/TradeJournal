@@ -93,9 +93,10 @@ def trading_dates(url: str) -> list:
         return [d for (d,) in conn.execute("select distinct date from prices order by date").fetchall()]
 
 
-def run_screen(url: str, start, end, threshold: int, min_value: float, min_price: float) -> pd.DataFrame:
+def run_screen(url: str, start, end, threshold: int, min_value: float, min_price: float,
+               code: str | None = None) -> pd.DataFrame:
     params = {"start": start, "end": end, "thr": threshold, "cap": PRICE_LIMIT_PCT + LIMIT_TOLERANCE,
-              "min_value": min_value, "min_price": min_price}
+              "min_value": min_value, "min_price": min_price, "code": code}
     with connect(url) as conn:
         cur = conn.execute(SCREEN_SQL, params)
         columns = [c.name for c in cur.description]
@@ -126,3 +127,39 @@ def delete_all(url: str) -> int:
         n = conn.execute("select count(*) from prices").fetchone()[0]
         conn.execute("truncate table prices, upload_log restart identity")
     return n
+
+
+def trading_codes(url: str) -> list[str]:
+    with connect(url) as conn:
+        return [c for (c,) in conn.execute("select distinct code from prices order by code").fetchall()]
+
+
+def period_changes(url: str, codes: list[str], start, end) -> pd.DataFrame:
+    """Closes and reported daily changes of the given stocks, for screening.period_change()."""
+    with connect(url) as conn:
+        cur = conn.execute(
+            "select code, date, close, change_pct from prices "
+            "where code = any(%s) and date between %s and %s order by code, date",
+            (list(codes), start, end),
+        )
+        columns = [c.name for c in cur.description]
+        rows = cur.fetchall()
+    df = pd.DataFrame(rows, columns=columns)
+    df["close"] = df["close"].astype(float)
+    df["change_pct"] = df["change_pct"].astype(float)
+    return df
+
+
+def stock_history(url: str, code: str, start, end) -> pd.DataFrame:
+    with connect(url) as conn:
+        cur = conn.execute(
+            "select date, close, change_pct, volume, value from prices "
+            "where code = %s and date between %s and %s order by date",
+            (code, start, end),
+        )
+        columns = [c.name for c in cur.description]
+        rows = cur.fetchall()
+    df = pd.DataFrame(rows, columns=columns)
+    for col in ("close", "change_pct", "value"):
+        df[col] = df[col].astype(float)
+    return df

@@ -13,7 +13,8 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from parsing import parse_cafef  # noqa: E402
-from screening import LIMIT_TOLERANCE, PRICE_LIMIT_PCT, SCREEN_SQL, rank  # noqa: E402
+from screening import (LIMIT_TOLERANCE, PRICE_LIMIT_PCT, SCREEN_SQL, period_change,  # noqa: E402
+                       rank, summarize)
 
 CAP = PRICE_LIMIT_PCT + LIMIT_TOLERANCE
 
@@ -23,9 +24,9 @@ def to_sqlite(sql: str) -> str:
     return re.sub(r"::\w+", "", sql)
 
 
-def run(conn, start, end, thr, min_value=0.0, min_price=0.0) -> pd.DataFrame:
+def run(conn, start, end, thr, min_value=0.0, min_price=0.0, code=None) -> pd.DataFrame:
     params = {"start": start, "end": end, "thr": thr, "cap": CAP,
-              "min_value": min_value, "min_price": min_price}
+              "min_value": min_value, "min_price": min_price, "code": code}
     return pd.read_sql_query(to_sqlite(SCREEN_SQL), conn, params=params)
 
 
@@ -89,6 +90,57 @@ def test_top_n_limit():
     assert len(rank(raw, "Days up")) == 20
 
 
+def test_code_search_bypasses_filters():
+    conn = make_db(ROWS)
+    # BBB trades 0.5 bn/day: excluded by a 1 bn filter, but a code search with no filter returns it
+    assert "BBB" not in set(run(conn, "2026-10-01", "2026-10-31", 3, min_value=1.0)["code"])
+    r = run(conn, "2026-10-01", "2026-10-31", 3, code="BBB")
+    assert list(r["code"]) == ["BBB"] and int(r.loc[0, "down_days"]) == 2
+
+
+def test_summarize_keeps_stock_without_big_moves():
+    raw = run(make_db(ROWS), "2026-10-01", "2026-10-31", 3, code="CCC")
+    s = summarize(raw)
+    assert len(s) == 1 and s.loc[0, "moves"] == 0 and pd.isna(s.loc[0, "up_share"])
+
+
+def test_period_change():
+    rows = pd.DataFrame({
+        "code": ["AAA"] * 3 + ["BBB"] * 3 + ["CCC"] * 3 + ["DDD"],
+        "date": ["2026-10-01", "2026-10-02", "2026-10-05"] * 3 + ["2026-10-01"],
+        "close": [100, 110, 99,        # AAA: first day excluded, +10% then -10%
+                  100, 50, 55,         # BBB: bonus-share day (raw -50%, reported 0%), then +10%
+                  10, 10, 10,          # CCC: reported +0.2% on flat closes is rounding noise
+                  7],                  # DDD: one day only
+        "change_pct": [5.0, 10.0, -10.0,
+                       1.0, 0.0, 10.0,
+                       0.2, 0.2, 0.2,
+                       3.0],
+    })
+    out = period_change(rows)
+    assert round(out["AAA"], 6) == -1.0
+    assert round(out["BBB"], 6) == 10.0
+    assert round(out["CCC"], 6) == 0.0
+    assert "DDD" not in out.index and pd.isna(out.reindex(["DDD"])["DDD"])
+
+
+def check_period_change(df, start="2026-07-01", end="2026-10-15"):
+    """Without a corporate-action day the result must equal last close / first close - 1."""
+    sub = df[(df["date"].astype(str) >= start) & (df["date"].astype(str) <= end)].sort_values(["code", "date"]).copy()
+    sub["raw"] = sub.groupby("code")["close"].pct_change() * 100
+    sub["event"] = (sub["change_pct"].astype(float) - sub["raw"]).abs() >= 1.0
+    has_event = sub.groupby("code")["event"].any()
+    mine = period_change(sub[["code", "date", "close", "change_pct"]])
+    ratio = (sub.groupby("code")["close"].last() / sub.groupby("code")["close"].first() - 1) * 100
+    plain = has_event[~has_event].index.intersection(mine.index)
+    diff = (mine[plain] - ratio[plain]).abs()
+    assert diff.max() < 1e-6, f"max diff {diff.max()}"
+    ev = has_event[has_event].index.intersection(mine.index)
+    print(f"period change: {len(plain)} stocks without corporate-action days match close ratio exactly; "
+          f"{len(ev)} stocks with such days differ from the raw ratio by a median "
+          f"{(mine[ev] - ratio[ev]).abs().median():.1f} points")
+
+
 def check_real_file(path):
     df, _ = parse_cafef(path)
     conn = sqlite3.connect(":memory:")
@@ -106,6 +158,7 @@ def check_real_file(path):
     got = got.reindex(expect.index.union(got.index)).fillna(0).astype(int)
     expect = expect.reindex(got.index).fillna(0).astype(int)
     assert got.equals(expect), "SQL counts differ from the pandas calculation"
+    check_period_change(df)
     print(f"real file ok: {len(got)} stocks, {int(got['up'].sum())} up days, {int(got['down'].sum())} down days")
 
 
